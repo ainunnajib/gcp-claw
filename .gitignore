@@ -1,0 +1,23 @@
+# Environment & secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# ADK session data
+.adk/
+
+# Runtime directories (created by agent)
+gcpclaw/workspace/
+gcpclaw/extensions/*/
+!gcpclaw/extensions/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
