@@ -7,6 +7,7 @@ from typing import cast
 from urllib.parse import urlparse
 
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 
 BLOCKED_HOSTS = {
@@ -30,26 +31,29 @@ def _is_blocked_ip(ip: str) -> bool:
     )
 
 
-def _validate_public_http_url(url: str) -> tuple[bool, str]:
+def _validate_public_http_url(url: str) -> tuple[bool, str, str | None]:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
-        return False, "Only http/https URLs are allowed"
+        return False, "Only http/https URLs are allowed", None
     if not parsed.hostname:
-        return False, "URL must include a valid hostname"
+        return False, "URL must include a valid hostname", None
     host = parsed.hostname.lower()
     if host in BLOCKED_HOSTS:
-        return False, f"Blocked host: {host}"
+        return False, f"Blocked host: {host}", None
 
     try:
         infos = socket.getaddrinfo(host, parsed.port, proto=socket.IPPROTO_TCP)
     except socket.gaierror:
-        return False, "Hostname could not be resolved"
+        return False, "Hostname could not be resolved", None
 
+    resolved_ip: str | None = None
     for info in infos:
         ip = cast(str, info[4][0])
+        if resolved_ip is None:
+            resolved_ip = ip
         if _is_blocked_ip(ip):
-            return False, f"Blocked private/internal address: {ip}"
-    return True, "OK"
+            return False, f"Blocked private/internal address: {ip}", None
+    return True, "OK", resolved_ip
 
 
 def search_web(query: str, num_results: int = 5) -> dict:
@@ -106,7 +110,7 @@ def _search_google_cse(query: str, num: int, api_key: str, cse_id: str) -> dict:
             for item in data.get("items", [])
         ]
         return {"query": query, "results": results}
-    except Exception as e:
+    except (requests.RequestException, KeyError, ValueError) as e:
         return {"error": f"Google CSE search failed: {e}"}
 
 
@@ -130,7 +134,7 @@ def _search_serpapi(query: str, num: int, api_key: str) -> dict:
             for r in data.get("organic_results", [])
         ]
         return {"query": query, "results": results}
-    except Exception as e:
+    except (requests.RequestException, KeyError, ValueError) as e:
         return {"error": f"SerpAPI search failed: {e}"}
 
 
@@ -145,18 +149,53 @@ def fetch_url(url: str) -> dict:
     Returns:
         dict with 'title', 'content' (text), and 'url', or 'error'.
     """
-    is_valid, reason = _validate_public_http_url(url)
+    is_valid, reason, resolved_ip = _validate_public_http_url(url)
     if not is_valid:
         return {"error": reason}
+    if not resolved_ip:
+        return {"error": "URL validation failed to resolve host"}
 
     try:
-        headers = {"User-Agent": "GCPClaw/1.0 (personal AI assistant)"}
-        resp = requests.get(url, headers=headers, timeout=15, allow_redirects=False)
-        if resp.is_redirect:
-            return {"error": "Redirects are blocked for security reasons"}
-        resp.raise_for_status()
+        parsed = urlparse(url)
+        if not parsed.hostname:
+            return {"error": "URL must include a valid hostname"}
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path_and_query = parsed.path or "/"
+        if parsed.query:
+            path_and_query = f"{path_and_query}?{parsed.query}"
+        headers = {
+            "User-Agent": "GCPClaw/1.0 (personal AI assistant)",
+            "Host": parsed.hostname,
+        }
 
-        soup = BeautifulSoup(resp.text, "html.parser")
+        pool: urllib3.HTTPConnectionPool | urllib3.HTTPSConnectionPool
+        if parsed.scheme == "https":
+            pool = urllib3.HTTPSConnectionPool(
+                host=resolved_ip,
+                port=port,
+                assert_hostname=parsed.hostname,
+                server_hostname=parsed.hostname,
+                cert_reqs="CERT_REQUIRED",
+            )
+        else:
+            pool = urllib3.HTTPConnectionPool(host=resolved_ip, port=port)
+
+        resp = pool.urlopen(
+            method="GET",
+            url=path_and_query,
+            headers=headers,
+            timeout=urllib3.Timeout(connect=5.0, read=15.0),
+            redirect=False,
+            retries=False,
+            assert_same_host=False,
+        )
+        if 300 <= resp.status < 400:
+            return {"error": "Redirects are blocked for security reasons"}
+        if resp.status >= 400:
+            return {"error": f"Failed to fetch {url}: HTTP {resp.status}"}
+
+        html = resp.data.decode("utf-8", errors="replace")
+        soup = BeautifulSoup(html, "html.parser")
 
         # Remove non-content elements
         for tag in soup(["script", "style", "nav", "header", "footer", "iframe"]):
@@ -171,5 +210,5 @@ def fetch_url(url: str) -> dict:
             text = text[:max_chars] + f"\n\n... (truncated, total {len(text)} chars)"
 
         return {"url": url, "title": title, "content": text}
-    except Exception as e:
+    except (urllib3.exceptions.HTTPError, ValueError) as e:
         return {"error": f"Failed to fetch {url}: {e}"}

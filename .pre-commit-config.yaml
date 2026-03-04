@@ -1,0 +1,25 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.13.2
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.18.2
+    hooks:
+      - id: mypy
+        additional_dependencies:
+          - types-requests>=2.32.4
+          - types-PyYAML>=6.0.12
+        args: [--config-file=pyproject.toml, gcpclaw]
+        pass_filenames: false
+  - repo: local
+    hooks:
+      - id: bandit
+        name: bandit
+        entry: bandit -q -r gcpclaw -c bandit.yaml
+        language: python
+        types: [python]
+        additional_dependencies: [bandit>=1.8.6]
+        pass_filenames: false

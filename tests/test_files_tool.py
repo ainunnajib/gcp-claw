@@ -20,3 +20,16 @@ def test_path_traversal_is_blocked(monkeypatch, tmp_path):
     result = write_file("../workspace2/escape.txt", "bad")
     assert "error" in result
     assert "escapes the workspace directory" in result["error"]
+
+
+def test_symlink_is_rejected(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("sensitive data", encoding="utf-8")
+    (workspace / "link.txt").symlink_to(secret)
+    monkeypatch.setenv("WORKSPACE_DIR", str(workspace))
+
+    result = read_file("link.txt")
+    assert "error" in result
+    assert "symlink" in result["error"].lower()

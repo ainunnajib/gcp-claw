@@ -5,10 +5,9 @@ from __future__ import annotations
 import ast
 import json
 import logging
-import os
 import re
 import subprocess
-import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from ..config import (
@@ -16,6 +15,8 @@ from ..config import (
     extension_execution_enabled,
     get_extensions_dir,
 )
+from ..logging_utils import emit_audit_event
+from .extension_sandbox import build_runner_command, run_in_sandbox
 
 LOGGER = logging.getLogger(__name__)
 
@@ -107,14 +108,10 @@ def _validate_extension_code(code: str) -> tuple[bool, str]:
     return True, "OK"
 
 
-def _safe_env() -> dict[str, str]:
-    return {
-        "PATH": os.getenv("PATH", ""),
-        "LANG": os.getenv("LANG", "C.UTF-8"),
-    }
-
-
-def _build_function_wrapper(ext_dir: Path, function_name: str):
+def _build_function_wrapper(
+    ext_dir: Path,
+    function_name: str,
+) -> Callable[..., dict[str, object]]:
     def _tool(payload_json: str = "{}") -> dict[str, object]:
         """Execute extension function with JSON arguments in isolated subprocess."""
         try:
@@ -124,27 +121,9 @@ def _build_function_wrapper(ext_dir: Path, function_name: str):
         except json.JSONDecodeError as exc:
             return {"error": f"Invalid JSON payload: {exc}"}
 
-        command = [
-            sys.executable,
-            "-I",
-            str(RUNNER_PATH),
-            "--tool-file",
-            str(ext_dir / "tool.py"),
-            "--function",
-            function_name,
-            "--args-json",
-            json.dumps(payload),
-        ]
+        command = build_runner_command(ext_dir, RUNNER_PATH, function_name, payload)
         try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=10,
-                cwd=ext_dir,
-                env=_safe_env(),
-                shell=False,
-            )  # nosec B603
+            result = run_in_sandbox(command, cwd=ext_dir, timeout=10)
         except subprocess.TimeoutExpired:
             return {"error": "Extension execution timed out"}
         except Exception as exc:
@@ -165,8 +144,7 @@ def _build_function_wrapper(ext_dir: Path, function_name: str):
 
     _tool.__name__ = function_name
     _tool.__doc__ = (
-        f"Execute extension function '{function_name}'. "
-        "Pass arguments as JSON in `payload_json`."
+        f"Execute extension function '{function_name}'. Pass arguments as JSON in `payload_json`."
     )
     return _tool
 
@@ -196,6 +174,13 @@ def create_extension(name: str, description: str, code: str) -> dict:
     This tool is disabled by default. Set ENABLE_DANGEROUS_TOOLS=true to use it.
     """
     if not dangerous_tools_enabled():
+        emit_audit_event(
+            LOGGER,
+            action="create_extension",
+            actor="system",
+            status="blocked",
+            details={"reason": "dangerous_tools_disabled"},
+        )
         return {
             "error": (
                 "create_extension is disabled. Set ENABLE_DANGEROUS_TOOLS=true "
@@ -204,6 +189,13 @@ def create_extension(name: str, description: str, code: str) -> dict:
         }
 
     if not NAME_RE.match(name) or "--" in name:
+        emit_audit_event(
+            LOGGER,
+            action="create_extension",
+            actor="system",
+            status="blocked",
+            details={"reason": "invalid_name", "name": name},
+        )
         return {
             "error": (
                 f"Invalid name '{name}'. Use lowercase letters, numbers, hyphens. "
@@ -213,6 +205,13 @@ def create_extension(name: str, description: str, code: str) -> dict:
 
     is_valid, reason = _validate_extension_code(code)
     if not is_valid:
+        emit_audit_event(
+            LOGGER,
+            action="create_extension",
+            actor="system",
+            status="blocked",
+            details={"reason": reason, "name": name},
+        )
         return {"error": f"Code validation failed: {reason}"}
 
     ext_dir = get_extensions_dir() / name
@@ -237,6 +236,13 @@ Auto-generated extension by GCPClaw.
 
     tree = ast.parse(code)
     func_names = _public_function_names(tree)
+    emit_audit_event(
+        LOGGER,
+        action="create_extension",
+        actor="system",
+        status="success",
+        details={"name": name, "functions": func_names},
+    )
     return {
         "status": "created",
         "name": name,
@@ -283,6 +289,13 @@ def list_extensions() -> dict:
 def remove_extension(name: str) -> dict:
     """Remove an installed extension by name."""
     if not dangerous_tools_enabled():
+        emit_audit_event(
+            LOGGER,
+            action="remove_extension",
+            actor="system",
+            status="blocked",
+            details={"reason": "dangerous_tools_disabled", "name": name},
+        )
         return {
             "error": (
                 "remove_extension is disabled. Set ENABLE_DANGEROUS_TOOLS=true "
@@ -290,9 +303,23 @@ def remove_extension(name: str) -> dict:
             )
         }
     if not NAME_RE.match(name) or "--" in name:
+        emit_audit_event(
+            LOGGER,
+            action="remove_extension",
+            actor="system",
+            status="blocked",
+            details={"reason": "invalid_name", "name": name},
+        )
         return {"error": "Invalid extension name"}
     ext_dir = get_extensions_dir() / name
     if not ext_dir.exists():
+        emit_audit_event(
+            LOGGER,
+            action="remove_extension",
+            actor="system",
+            status="error",
+            details={"reason": "not_found", "name": name},
+        )
         return {"error": f"Extension '{name}' not found"}
 
     for path in sorted(ext_dir.glob("**/*"), reverse=True):
@@ -301,4 +328,11 @@ def remove_extension(name: str) -> dict:
         elif path.is_dir():
             path.rmdir()
     ext_dir.rmdir()
+    emit_audit_event(
+        LOGGER,
+        action="remove_extension",
+        actor="system",
+        status="success",
+        details={"name": name},
+    )
     return {"status": "removed", "name": name}

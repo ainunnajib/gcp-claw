@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 
 from ..config import dangerous_tools_enabled, get_workspace_dir
+from ..logging_utils import emit_audit_event
 
 LOGGER = logging.getLogger(__name__)
 
@@ -32,13 +33,13 @@ ALLOWED_BASE_COMMANDS = {
     "sort",
     "uniq",
     "cut",
-    "sed",
-    "awk",
-    "find",
+    "grep",
     "rg",
     "pytest",
     "git",
 }
+
+PATH_RESTRICTED_COMMANDS = {"rg", "cat", "head", "tail", "grep"}
 
 
 def _command_policy_error(args: list[str]) -> str | None:
@@ -68,12 +69,40 @@ def _safe_env() -> dict[str, str]:
     return base_env
 
 
+def _validate_path_args(args: list[str], workspace: Path) -> str | None:
+    if not args:
+        return "Command is empty"
+    base = args[0]
+    if base not in PATH_RESTRICTED_COMMANDS:
+        return None
+
+    positional = [arg for arg in args[1:] if not arg.startswith("-")]
+    file_args = positional
+    if base in {"grep", "rg"} and positional:
+        # first positional argument is the search pattern
+        file_args = positional[1:]
+    for file_arg in file_args:
+        resolved = (workspace / file_arg).resolve()
+        try:
+            resolved.relative_to(workspace)
+        except ValueError:
+            return f"Path argument escapes workspace: {file_arg}"
+    return None
+
+
 def run_command(command: str, timeout: int = 30) -> dict:
     """Execute an allowlisted shell command and return output.
 
     This tool is disabled by default. Set ENABLE_DANGEROUS_TOOLS=true to use it.
     """
     if not dangerous_tools_enabled():
+        emit_audit_event(
+            LOGGER,
+            action="run_command",
+            actor="system",
+            status="blocked",
+            details={"reason": "dangerous_tools_disabled"},
+        )
         return {
             "error": (
                 "run_command is disabled. Set ENABLE_DANGEROUS_TOOLS=true "
@@ -90,7 +119,29 @@ def run_command(command: str, timeout: int = 30) -> dict:
     policy_error = _command_policy_error(args)
     if policy_error:
         LOGGER.warning("shell_command_blocked", extra={"event": "shell_command_blocked"})
+        emit_audit_event(
+            LOGGER,
+            action="run_command",
+            actor="system",
+            status="blocked",
+            details={"reason": policy_error, "command": command},
+        )
         return {"error": policy_error}
+    workspace = get_workspace_dir()
+    path_error = _validate_path_args(args, workspace)
+    if path_error:
+        LOGGER.warning(
+            "shell_command_path_blocked",
+            extra={"event": "shell_command_path_blocked"},
+        )
+        emit_audit_event(
+            LOGGER,
+            action="run_command",
+            actor="system",
+            status="blocked",
+            details={"reason": path_error, "command": command},
+        )
+        return {"error": path_error}
 
     try:
         result = subprocess.run(
@@ -99,13 +150,27 @@ def run_command(command: str, timeout: int = 30) -> dict:
             capture_output=True,
             text=True,
             timeout=timeout,
-            cwd=get_workspace_dir(),
+            cwd=workspace,
             env=_safe_env(),
         )  # nosec B603
     except subprocess.TimeoutExpired:
+        emit_audit_event(
+            LOGGER,
+            action="run_command",
+            actor="system",
+            status="error",
+            details={"reason": "timeout", "command": command, "timeout": timeout},
+        )
         return {"error": f"Command timed out after {timeout}s"}
     except Exception as exc:
         LOGGER.exception("shell_command_failed")
+        emit_audit_event(
+            LOGGER,
+            action="run_command",
+            actor="system",
+            status="error",
+            details={"reason": str(exc), "command": command},
+        )
         return {"error": str(exc)}
 
     max_output = 50_000
@@ -116,8 +181,16 @@ def run_command(command: str, timeout: int = 30) -> dict:
     if len(result.stderr) > max_output:
         stderr += f"\n... (truncated, total {len(result.stderr)} chars)"
 
-    return {
+    response = {
         "stdout": stdout,
         "stderr": stderr,
         "returncode": result.returncode,
     }
+    emit_audit_event(
+        LOGGER,
+        action="run_command",
+        actor="system",
+        status="success" if result.returncode == 0 else "error",
+        details={"command": command, "returncode": result.returncode},
+    )
+    return response

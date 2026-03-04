@@ -1,14 +1,20 @@
 """GCPClaw configuration module."""
 
+from __future__ import annotations
+
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from dotenv import load_dotenv
+
+if TYPE_CHECKING:
+    from google.adk.models.lite_llm import LiteLlm
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 
-def get_model():
+def get_model() -> str | LiteLlm:
     """Get the configured model, supporting both native Gemini and LiteLLM models.
 
     Set AGENT_MODEL env var to control which model is used:
@@ -20,6 +26,7 @@ def get_model():
     model_id = os.getenv("AGENT_MODEL", "gemini-2.0-flash")
     if "/" in model_id:
         from google.adk.models.lite_llm import LiteLlm
+
         return LiteLlm(model=model_id)
     return model_id
 
@@ -65,3 +72,36 @@ def dangerous_tools_enabled() -> bool:
 def extension_execution_enabled() -> bool:
     """Whether runtime execution of user-generated extension tools is enabled."""
     return _env_bool("ENABLE_EXTENSION_EXECUTION", default=False)
+
+
+def extension_container_enabled() -> bool:
+    """Whether extensions should execute inside a container sandbox."""
+    return _env_bool("ENABLE_EXTENSION_CONTAINER", default=False)
+
+
+def extension_container_image() -> str:
+    """Container image used for extension runner execution."""
+    return os.getenv("EXTENSION_CONTAINER_IMAGE", "python:3.11-slim")
+
+
+def validate_config() -> list[str]:
+    """Validate configuration and return warning messages."""
+    warnings: list[str] = []
+    model = os.getenv("AGENT_MODEL", "gemini-2.0-flash")
+    if "/" in model:
+        provider = model.split("/", 1)[0]
+        key_map = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
+        expected_key = key_map.get(provider)
+        if expected_key and not os.getenv(expected_key):
+            warnings.append(f"AGENT_MODEL uses {provider} but {expected_key} is not set")
+    elif not os.getenv("GOOGLE_API_KEY"):
+        warnings.append("AGENT_MODEL uses Gemini but GOOGLE_API_KEY is not set")
+
+    workspace = get_workspace_dir()
+    try:
+        test_file = workspace / ".config_test"
+        test_file.write_text("test", encoding="utf-8")
+        test_file.unlink()
+    except OSError as exc:
+        warnings.append(f"Workspace directory is not writable: {exc}")
+    return warnings

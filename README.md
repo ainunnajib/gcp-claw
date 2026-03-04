@@ -32,6 +32,7 @@ cp .env.example .env
 # Keep security flags at defaults unless you explicitly want risky tools:
 # ENABLE_DANGEROUS_TOOLS=false
 # ENABLE_EXTENSION_EXECUTION=false
+# ENABLE_EXTENSION_CONTAINER=false
 
 # Run
 adk web gcpclaw    # Web UI at http://localhost:8000
@@ -102,18 +103,29 @@ The agent will:
 
 - `run_command`, `create_extension`, and `remove_extension` are disabled unless `ENABLE_DANGEROUS_TOOLS=true`
 - `fetch_url` includes SSRF guardrails: only `http/https`, no localhost/private/link-local targets, no redirects
+- `fetch_url` pins resolved DNS target during fetch to reduce DNS rebinding risk
 - File tools use strict path ancestry checks to block traversal
+- File tools reject symlink-based path escapes
 - Extension code is never imported into the main process
+- Extension execution can be containerized (no network, read-only, resource limited) via `ENABLE_EXTENSION_CONTAINER=true`
 
 ## Development
 
 ```bash
-pip install -r requirements.txt -r requirements-dev.txt
+pip install -r requirements.lock -r requirements-dev.lock
 ruff check gcpclaw tests
 mypy gcpclaw
 pytest
-bandit -q -r gcpclaw
-pip-audit -r requirements.txt
+bandit -q -r gcpclaw -c bandit.yaml
+pip-audit -r requirements.lock --no-deps --disable-pip
+pre-commit run --all-files
+```
+
+## Lockfile Workflow
+
+```bash
+pip-compile requirements.in -o requirements.lock
+pip-compile requirements-dev.in -o requirements-dev.lock
 ```
 
 ## License

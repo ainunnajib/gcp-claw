@@ -6,9 +6,15 @@ from ..config import get_workspace_dir
 
 
 def _resolve_safe(path: str) -> Path:
-    """Resolve a path within the workspace, preventing directory traversal."""
+    """Resolve a path within the workspace, preventing traversal and symlink escape."""
     workspace = get_workspace_dir()
-    resolved = (workspace / path).resolve()
+    candidate = workspace / path
+    check = workspace
+    for part in Path(path).parts:
+        check = check / part
+        if check.exists() and check.is_symlink():
+            raise ValueError(f"Symlinks are not allowed in path: {path}")
+    resolved = candidate.resolve()
     try:
         resolved.relative_to(workspace)
     except ValueError:
@@ -31,7 +37,7 @@ def read_file(path: str) -> dict:
             return {"error": f"File not found: {path}"}
         content = resolved.read_text(encoding="utf-8", errors="replace")
         return {"path": path, "content": content, "size": len(content)}
-    except Exception as e:
+    except (ValueError, OSError) as e:
         return {"error": str(e)}
 
 
@@ -50,7 +56,7 @@ def write_file(path: str, content: str) -> dict:
         resolved.parent.mkdir(parents=True, exist_ok=True)
         resolved.write_text(content, encoding="utf-8")
         return {"status": "written", "path": path, "size": len(content)}
-    except Exception as e:
+    except (ValueError, OSError) as e:
         return {"error": str(e)}
 
 
@@ -70,12 +76,14 @@ def list_files(directory: str = ".") -> dict:
         entries = []
         for item in sorted(resolved.iterdir()):
             rel = item.relative_to(get_workspace_dir())
-            entries.append({
-                "name": item.name,
-                "path": str(rel),
-                "type": "directory" if item.is_dir() else "file",
-                "size": item.stat().st_size if item.is_file() else None,
-            })
+            entries.append(
+                {
+                    "name": item.name,
+                    "path": str(rel),
+                    "type": "directory" if item.is_dir() else "file",
+                    "size": item.stat().st_size if item.is_file() else None,
+                }
+            )
         return {"directory": directory, "entries": entries}
-    except Exception as e:
+    except (ValueError, OSError) as e:
         return {"error": str(e)}

@@ -11,6 +11,7 @@ from .config import (
     extension_execution_enabled,
     get_model,
     get_skills_dirs,
+    validate_config,
 )
 from .logging_utils import configure_logging
 from .tools.extend import (
@@ -25,6 +26,8 @@ from .tools.web import fetch_url, search_web
 
 configure_logging()
 LOGGER = logging.getLogger(__name__)
+for warning in validate_config():
+    LOGGER.warning(warning, extra={"event": "config_warning"})
 
 
 def _parse_skill_frontmatter(skill_md_path: Path) -> dict | None:
@@ -51,17 +54,20 @@ def discover_skills(skills_dirs: list[Path]) -> list[dict]:
         for skill_md in d.rglob("SKILL.md"):
             meta = _parse_skill_frontmatter(skill_md)
             if meta and "name" in meta and "description" in meta:
-                skills.append({
-                    "name": meta["name"],
-                    "description": meta["description"],
-                    "path": str(skill_md.parent),
-                })
+                skills.append(
+                    {
+                        "name": meta["name"],
+                        "description": meta["description"],
+                        "path": str(skill_md.parent),
+                    }
+                )
     return skills
 
 
 def load_extension_tools() -> list:
     """Load all extension tools from the extensions directory."""
     from .config import get_extensions_dir
+
     ext_dir = get_extensions_dir()
     all_functions = []
     for child in sorted(ext_dir.iterdir()):
@@ -70,9 +76,7 @@ def load_extension_tools() -> list:
                 functions = _load_extension_functions(child)
                 all_functions.extend(functions)
             except Exception:
-                LOGGER.exception(
-                    "extension_load_failed", extra={"event": "extension_load_failed"}
-                )
+                LOGGER.exception("extension_load_failed", extra={"event": "extension_load_failed"})
     return all_functions
 
 
@@ -93,8 +97,11 @@ extension_tools = load_extension_tools()
 
 # Core tools
 core_tools = [
-    search_web, fetch_url,
-    read_file, write_file, list_files,
+    search_web,
+    fetch_url,
+    read_file,
+    write_file,
+    list_files,
     list_extensions,
 ]
 if dangerous_tools_enabled():

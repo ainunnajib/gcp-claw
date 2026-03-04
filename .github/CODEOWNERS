@@ -1,0 +1,7 @@
+# Security-sensitive areas require maintainer review
+/gcpclaw/tools/ @ainunnajib
+/gcpclaw/agent.py @ainunnajib
+/gcpclaw/config.py @ainunnajib
+/.github/workflows/ @ainunnajib
+/requirements*.txt @ainunnajib
+/pyproject.toml @ainunnajib
