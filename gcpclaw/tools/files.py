@@ -1,6 +1,5 @@
 """File operation tools — sandboxed to the configured workspace directory."""
 
-import os
 from pathlib import Path
 
 from ..config import get_workspace_dir
@@ -10,8 +9,10 @@ def _resolve_safe(path: str) -> Path:
     """Resolve a path within the workspace, preventing directory traversal."""
     workspace = get_workspace_dir()
     resolved = (workspace / path).resolve()
-    if not str(resolved).startswith(str(workspace)):
-        raise ValueError(f"Path '{path}' escapes the workspace directory")
+    try:
+        resolved.relative_to(workspace)
+    except ValueError:
+        raise ValueError(f"Path '{path}' escapes the workspace directory") from None
     return resolved
 
 

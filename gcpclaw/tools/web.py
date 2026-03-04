@@ -1,9 +1,55 @@
 """Web search and URL fetching tools."""
 
+import ipaddress
 import os
+import socket
+from typing import cast
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
+
+BLOCKED_HOSTS = {
+    "localhost",
+    "metadata.google.internal",
+    "169.254.169.254",
+}
+
+
+def _is_blocked_ip(ip: str) -> bool:
+    ip_obj = ipaddress.ip_address(ip)
+    return any(
+        [
+            ip_obj.is_private,
+            ip_obj.is_loopback,
+            ip_obj.is_link_local,
+            ip_obj.is_multicast,
+            ip_obj.is_reserved,
+            ip_obj.is_unspecified,
+        ]
+    )
+
+
+def _validate_public_http_url(url: str) -> tuple[bool, str]:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return False, "Only http/https URLs are allowed"
+    if not parsed.hostname:
+        return False, "URL must include a valid hostname"
+    host = parsed.hostname.lower()
+    if host in BLOCKED_HOSTS:
+        return False, f"Blocked host: {host}"
+
+    try:
+        infos = socket.getaddrinfo(host, parsed.port, proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        return False, "Hostname could not be resolved"
+
+    for info in infos:
+        ip = cast(str, info[4][0])
+        if _is_blocked_ip(ip):
+            return False, f"Blocked private/internal address: {ip}"
+    return True, "OK"
 
 
 def search_web(query: str, num_results: int = 5) -> dict:
@@ -32,14 +78,25 @@ def search_web(query: str, num_results: int = 5) -> dict:
     if serpapi_key:
         return _search_serpapi(query, num_results, serpapi_key)
 
-    return {"error": "No search API configured. Set GOOGLE_CSE_API_KEY+GOOGLE_CSE_ID or SERPAPI_API_KEY in .env"}
+    return {
+        "error": (
+            "No search API configured. Set GOOGLE_CSE_API_KEY+GOOGLE_CSE_ID "
+            "or SERPAPI_API_KEY in .env"
+        )
+    }
 
 
 def _search_google_cse(query: str, num: int, api_key: str, cse_id: str) -> dict:
     try:
+        params: dict[str, str | int] = {
+            "key": api_key,
+            "cx": cse_id,
+            "q": query,
+            "num": num,
+        }
         resp = requests.get(
             "https://www.googleapis.com/customsearch/v1",
-            params={"key": api_key, "cx": cse_id, "q": query, "num": num},
+            params=params,
             timeout=10,
         )
         resp.raise_for_status()
@@ -55,9 +112,15 @@ def _search_google_cse(query: str, num: int, api_key: str, cse_id: str) -> dict:
 
 def _search_serpapi(query: str, num: int, api_key: str) -> dict:
     try:
+        params: dict[str, str | int] = {
+            "api_key": api_key,
+            "q": query,
+            "num": num,
+            "engine": "google",
+        }
         resp = requests.get(
             "https://serpapi.com/search",
-            params={"api_key": api_key, "q": query, "num": num, "engine": "google"},
+            params=params,
             timeout=10,
         )
         resp.raise_for_status()
@@ -82,9 +145,15 @@ def fetch_url(url: str) -> dict:
     Returns:
         dict with 'title', 'content' (text), and 'url', or 'error'.
     """
+    is_valid, reason = _validate_public_http_url(url)
+    if not is_valid:
+        return {"error": reason}
+
     try:
         headers = {"User-Agent": "GCPClaw/1.0 (personal AI assistant)"}
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = requests.get(url, headers=headers, timeout=15, allow_redirects=False)
+        if resp.is_redirect:
+            return {"error": "Redirects are blocked for security reasons"}
         resp.raise_for_status()
 
         soup = BeautifulSoup(resp.text, "html.parser")

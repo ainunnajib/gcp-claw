@@ -1,20 +1,30 @@
 """GCPClaw — A self-extending personal AI assistant built on Google Cloud ADK."""
 
-import yaml
+import logging
 from pathlib import Path
 
+import yaml
 from google.adk.agents import LlmAgent
 
-from .config import get_model, get_skills_dirs
-from .tools.web import search_web, fetch_url
-from .tools.files import read_file, write_file, list_files
-from .tools.shell import run_command
+from .config import (
+    dangerous_tools_enabled,
+    extension_execution_enabled,
+    get_model,
+    get_skills_dirs,
+)
+from .logging_utils import configure_logging
 from .tools.extend import (
+    _load_extension_functions,
     create_extension,
     list_extensions,
     remove_extension,
-    _load_extension_functions,
 )
+from .tools.files import list_files, read_file, write_file
+from .tools.shell import run_command
+from .tools.web import fetch_url, search_web
+
+configure_logging()
+LOGGER = logging.getLogger(__name__)
 
 
 def _parse_skill_frontmatter(skill_md_path: Path) -> dict | None:
@@ -60,7 +70,9 @@ def load_extension_tools() -> list:
                 functions = _load_extension_functions(child)
                 all_functions.extend(functions)
             except Exception:
-                pass  # Skip broken extensions
+                LOGGER.exception(
+                    "extension_load_failed", extra={"event": "extension_load_failed"}
+                )
     return all_functions
 
 
@@ -83,9 +95,20 @@ extension_tools = load_extension_tools()
 core_tools = [
     search_web, fetch_url,
     read_file, write_file, list_files,
-    run_command,
-    create_extension, list_extensions, remove_extension,
+    list_extensions,
 ]
+if dangerous_tools_enabled():
+    core_tools.extend([run_command, create_extension, remove_extension])
+
+if extension_execution_enabled():
+    extension_mode_note = (
+        "Extension execution is enabled. Extension tools run in isolated subprocesses."
+    )
+else:
+    extension_mode_note = (
+        "Extension execution is disabled by default. Set ENABLE_EXTENSION_EXECUTION=true "
+        "to enable extension tools."
+    )
 
 root_agent = LlmAgent(
     name="gcpclaw",
@@ -104,10 +127,13 @@ root_agent = LlmAgent(
 When a user asks you to do something you can't do yet, use `create_extension` to write
 a new Python tool for yourself. The extension code must be self-contained and can use
 standard library modules (json, csv, re, datetime, math, collections, etc.).
-Extensions are sandboxed — no network, no subprocess, no dangerous operations.
+Extension execution can be disabled by policy and is never loaded in-process.
 
-After creating an extension, its functions are immediately available as tools.
-Extensions persist to disk and auto-load on restart.
+Created extensions persist to disk and can be loaded when policy allows execution.
+
+## Runtime Security Policy
+- Dangerous tools are opt-in via ENABLE_DANGEROUS_TOOLS=true
+- {extension_mode_note}
 
 ## Available Skills
 {skills_index}
@@ -117,6 +143,6 @@ Extensions persist to disk and auto-load on restart.
 - Ask for clarification when the request is ambiguous
 - When creating extensions, write clean code with docstrings so your functions work well as tools
 - Always explain what you're doing before taking actions
-""",
+    """,
     tools=core_tools + extension_tools,
 )

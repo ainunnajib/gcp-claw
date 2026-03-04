@@ -1,125 +1,224 @@
-"""Self-extension tool — allows the agent to create new tools at runtime.
+"""Self-extension tool with strict validation and isolated execution."""
 
-Extensions are sandboxed: blocked from using dangerous imports like subprocess,
-socket, ctypes, etc. They persist to disk and auto-load on next startup.
-Each extension gets a SKILL.md file for discoverability.
-"""
+from __future__ import annotations
 
 import ast
-import importlib.util
+import json
+import logging
+import os
+import re
+import subprocess
 import sys
 from pathlib import Path
 
-from ..config import get_extensions_dir
+from ..config import (
+    dangerous_tools_enabled,
+    extension_execution_enabled,
+    get_extensions_dir,
+)
 
-# Imports that are blocked in extension code
-SANDBOX_BLOCKED_IMPORTS = {
-    "subprocess", "socket", "http.client", "http.server",
-    "urllib.request", "urllib.parse", "urllib.error",
-    "ctypes", "multiprocessing", "threading",
-    "shutil", "signal", "pty", "fcntl", "termios",
-    "webbrowser", "xmlrpc", "ftplib", "smtplib", "poplib", "imaplib",
+LOGGER = logging.getLogger(__name__)
+
+ALLOWED_IMPORTS = {
+    "json",
+    "csv",
+    "re",
+    "math",
+    "datetime",
+    "decimal",
+    "statistics",
+    "string",
+    "itertools",
+    "collections",
+    "functools",
+    "operator",
+    "typing",
+    "fractions",
+    "random",
 }
 
-# Builtins that are blocked in extension code
-SANDBOX_BLOCKED_BUILTINS = {"exec", "eval", "compile", "__import__", "open"}
+BLOCKED_CALLS = {
+    "exec",
+    "eval",
+    "compile",
+    "open",
+    "input",
+    "__import__",
+    "globals",
+    "locals",
+    "vars",
+    "getattr",
+    "setattr",
+    "delattr",
+}
+
+NAME_RE = re.compile(r"^[a-z][a-z0-9-]*[a-z0-9]$")
+RUNNER_PATH = Path(__file__).with_name("extension_runner.py")
+
+
+def _public_function_names(tree: ast.Module) -> list[str]:
+    return [
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")
+    ]
 
 
 def _validate_extension_code(code: str) -> tuple[bool, str]:
-    """Validate extension code against sandbox rules using AST analysis.
-
-    Returns (is_valid, reason).
-    """
+    """Validate extension code against strict static safety rules."""
     try:
         tree = ast.parse(code)
-    except SyntaxError as e:
-        return False, f"Syntax error: {e}"
+    except SyntaxError as exc:
+        return False, f"Syntax error: {exc}"
+
+    if any(isinstance(node, ast.ClassDef) for node in tree.body):
+        return False, "Class definitions are not allowed"
+
+    functions = _public_function_names(tree)
+    if not functions:
+        return False, "At least one public top-level function is required"
 
     for node in ast.walk(tree):
-        # Check import statements
         if isinstance(node, ast.Import):
             for alias in node.names:
-                module = alias.name.split(".")[0]
-                if alias.name in SANDBOX_BLOCKED_IMPORTS or module in SANDBOX_BLOCKED_IMPORTS:
-                    return False, f"Blocked import: {alias.name}"
+                root = alias.name.split(".")[0]
+                if root not in ALLOWED_IMPORTS:
+                    return False, f"Import '{alias.name}' is not allowed"
 
         elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                module = node.module.split(".")[0]
-                if node.module in SANDBOX_BLOCKED_IMPORTS or module in SANDBOX_BLOCKED_IMPORTS:
-                    return False, f"Blocked import: {node.module}"
+            if not node.module:
+                return False, "Relative imports are not allowed"
+            root = node.module.split(".")[0]
+            if root not in ALLOWED_IMPORTS:
+                return False, f"Import '{node.module}' is not allowed"
 
-        # Check for blocked builtins
         elif isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name) and node.func.id in SANDBOX_BLOCKED_BUILTINS:
-                return False, f"Blocked builtin: {node.func.id}"
+            if isinstance(node.func, ast.Name) and node.func.id in BLOCKED_CALLS:
+                return False, f"Blocked function call: {node.func.id}"
 
-        # Check for os.system, os.popen, etc.
         elif isinstance(node, ast.Attribute):
-            if isinstance(node.value, ast.Name) and node.value.id == "os":
-                if node.attr in ("system", "popen", "exec", "execvp", "fork", "kill"):
-                    return False, f"Blocked os.{node.attr}"
+            if node.attr.startswith("__"):
+                return False, "Dunder attribute access is not allowed"
 
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and not node.name.startswith("_"):
+            if ast.get_docstring(node) is None:
+                return False, f"Function '{node.name}' must have a docstring"
     return True, "OK"
 
 
+def _safe_env() -> dict[str, str]:
+    return {
+        "PATH": os.getenv("PATH", ""),
+        "LANG": os.getenv("LANG", "C.UTF-8"),
+    }
+
+
+def _build_function_wrapper(ext_dir: Path, function_name: str):
+    def _tool(payload_json: str = "{}") -> dict[str, object]:
+        """Execute extension function with JSON arguments in isolated subprocess."""
+        try:
+            payload = json.loads(payload_json)
+            if not isinstance(payload, dict):
+                return {"error": "payload_json must decode to a JSON object"}
+        except json.JSONDecodeError as exc:
+            return {"error": f"Invalid JSON payload: {exc}"}
+
+        command = [
+            sys.executable,
+            "-I",
+            str(RUNNER_PATH),
+            "--tool-file",
+            str(ext_dir / "tool.py"),
+            "--function",
+            function_name,
+            "--args-json",
+            json.dumps(payload),
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                cwd=ext_dir,
+                env=_safe_env(),
+                shell=False,
+            )  # nosec B603
+        except subprocess.TimeoutExpired:
+            return {"error": "Extension execution timed out"}
+        except Exception as exc:
+            LOGGER.exception("extension_execution_failed")
+            return {"error": f"Extension execution failed: {exc}"}
+
+        if result.returncode != 0:
+            stderr = result.stderr.strip() or "unknown error"
+            return {"error": f"Extension subprocess failed: {stderr}"}
+
+        try:
+            output = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return {"error": "Extension subprocess returned invalid JSON"}
+        if not isinstance(output, dict):
+            return {"error": "Extension subprocess output must be a JSON object"}
+        return output
+
+    _tool.__name__ = function_name
+    _tool.__doc__ = (
+        f"Execute extension function '{function_name}'. "
+        "Pass arguments as JSON in `payload_json`."
+    )
+    return _tool
+
+
 def _load_extension_functions(ext_dir: Path) -> list:
-    """Dynamically load functions from an extension's tool.py."""
+    """Load extension function wrappers from an extension's tool.py."""
+    if not extension_execution_enabled():
+        return []
     tool_file = ext_dir / "tool.py"
     if not tool_file.exists():
         return []
+    code = tool_file.read_text(encoding="utf-8")
+    is_valid, reason = _validate_extension_code(code)
+    if not is_valid:
+        raise ValueError(f"Invalid extension code in {ext_dir.name}: {reason}")
 
-    module_name = f"gcpclaw_ext_{ext_dir.name.replace('-', '_')}"
-    spec = importlib.util.spec_from_file_location(module_name, tool_file)
-    if spec is None or spec.loader is None:
-        return []
-
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-
-    # Extract public callable functions (not starting with _)
+    tree = ast.parse(code)
     functions = []
-    for name in dir(module):
-        if not name.startswith("_"):
-            obj = getattr(module, name)
-            if callable(obj) and hasattr(obj, "__doc__"):
-                functions.append(obj)
+    for name in _public_function_names(tree):
+        functions.append(_build_function_wrapper(ext_dir, name))
     return functions
 
 
 def create_extension(name: str, description: str, code: str) -> dict:
-    """Create a new tool extension that expands your capabilities.
+    """Create a new tool extension.
 
-    Write Python code that defines functions. Each function becomes a new tool.
-    Extensions are sandboxed — no network, no subprocess, no dangerous operations.
-    Allowed: math, string ops, json, csv, re, datetime, collections, itertools, etc.
-
-    Args:
-        name: Extension name (lowercase letters, numbers, hyphens).
-        description: What this extension does.
-        code: Python source code defining one or more functions with docstrings.
-
-    Returns:
-        dict with creation status, or error details.
+    This tool is disabled by default. Set ENABLE_DANGEROUS_TOOLS=true to use it.
     """
-    # Validate name
-    import re
-    if not re.match(r"^[a-z][a-z0-9-]*[a-z0-9]$", name) or "--" in name:
-        return {"error": f"Invalid name '{name}'. Use lowercase letters, numbers, hyphens. No leading/trailing hyphens."}
+    if not dangerous_tools_enabled():
+        return {
+            "error": (
+                "create_extension is disabled. Set ENABLE_DANGEROUS_TOOLS=true "
+                "to enable high-risk tools."
+            )
+        }
 
-    # Validate code
+    if not NAME_RE.match(name) or "--" in name:
+        return {
+            "error": (
+                f"Invalid name '{name}'. Use lowercase letters, numbers, hyphens. "
+                "No leading/trailing hyphens."
+            )
+        }
+
     is_valid, reason = _validate_extension_code(code)
     if not is_valid:
         return {"error": f"Code validation failed: {reason}"}
 
     ext_dir = get_extensions_dir() / name
     ext_dir.mkdir(parents=True, exist_ok=True)
-
-    # Write the tool code
     (ext_dir / "tool.py").write_text(code, encoding="utf-8")
 
-    # Write SKILL.md
     skill_md = f"""---
 name: {name}
 description: {description}
@@ -136,86 +235,70 @@ Auto-generated extension by GCPClaw.
 """
     (ext_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
 
-    # Try loading to verify it works
-    try:
-        functions = _load_extension_functions(ext_dir)
-        func_names = [f.__name__ for f in functions]
-    except Exception as e:
-        # Clean up on failure
-        (ext_dir / "tool.py").unlink(missing_ok=True)
-        (ext_dir / "SKILL.md").unlink(missing_ok=True)
-        ext_dir.rmdir()
-        return {"error": f"Extension failed to load: {e}"}
-
+    tree = ast.parse(code)
+    func_names = _public_function_names(tree)
     return {
         "status": "created",
         "name": name,
         "path": str(ext_dir),
         "functions": func_names,
-        "note": "Extension is saved and will auto-load on next startup. Functions are available now.",
+        "note": (
+            "Extension is saved. Set ENABLE_EXTENSION_EXECUTION=true and restart "
+            "to make extension tools callable."
+        ),
     }
 
 
 def list_extensions() -> dict:
-    """List all installed extensions and their tools.
-
-    Returns:
-        dict with 'extensions' list containing name, description, and function names.
-    """
+    """List all installed extensions and function names."""
     ext_dir = get_extensions_dir()
     extensions = []
-
     for child in sorted(ext_dir.iterdir()):
         if not child.is_dir():
             continue
-        skill_md = child / "SKILL.md"
         tool_py = child / "tool.py"
-
-        info = {"name": child.name, "has_code": tool_py.exists()}
-
-        # Parse description from SKILL.md
+        skill_md = child / "SKILL.md"
+        info = {
+            "name": child.name,
+            "has_code": tool_py.exists(),
+            "execution_enabled": extension_execution_enabled(),
+        }
         if skill_md.exists():
             content = skill_md.read_text(encoding="utf-8")
-            for line in content.split("\n"):
+            for line in content.splitlines():
                 if line.startswith("description:"):
                     info["description"] = line.split(":", 1)[1].strip()
                     break
-
-        # List function names
         if tool_py.exists():
             try:
                 tree = ast.parse(tool_py.read_text(encoding="utf-8"))
-                info["functions"] = [
-                    node.name for node in ast.walk(tree)
-                    if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")
-                ]
+                info["functions"] = _public_function_names(tree)
             except SyntaxError:
                 info["functions"] = []
                 info["error"] = "syntax error in tool.py"
-
         extensions.append(info)
-
     return {"extensions": extensions, "count": len(extensions)}
 
 
 def remove_extension(name: str) -> dict:
-    """Remove an installed extension by name.
-
-    Args:
-        name: The extension name to remove.
-
-    Returns:
-        dict with removal status.
-    """
+    """Remove an installed extension by name."""
+    if not dangerous_tools_enabled():
+        return {
+            "error": (
+                "remove_extension is disabled. Set ENABLE_DANGEROUS_TOOLS=true "
+                "to enable high-risk tools."
+            )
+        }
+    if not NAME_RE.match(name) or "--" in name:
+        return {"error": "Invalid extension name"}
     ext_dir = get_extensions_dir() / name
     if not ext_dir.exists():
         return {"error": f"Extension '{name}' not found"}
 
-    import shutil
-    shutil.rmtree(ext_dir)
-
-    # Remove from sys.modules if loaded
-    module_name = f"gcpclaw_ext_{name.replace('-', '_')}"
-    sys.modules.pop(module_name, None)
-
+    for path in sorted(ext_dir.glob("**/*"), reverse=True):
+        if path.is_file() or path.is_symlink():
+            path.unlink(missing_ok=True)
+        elif path.is_dir():
+            path.rmdir()
+    ext_dir.rmdir()
     return {"status": "removed", "name": name}

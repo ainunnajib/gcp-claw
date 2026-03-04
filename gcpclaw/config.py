@@ -24,6 +24,13 @@ def get_model():
     return model_id
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def get_workspace_dir() -> Path:
     """Get the workspace directory for sandboxed file operations."""
     workspace = os.getenv("WORKSPACE_DIR", str(_package_dir() / "workspace"))
@@ -48,3 +55,13 @@ def get_skills_dirs() -> list[Path]:
     """Get all directories to scan for SKILL.md files."""
     pkg = _package_dir()
     return [pkg / "skills", pkg / "extensions"]
+
+
+def dangerous_tools_enabled() -> bool:
+    """Whether risky tools (shell + extension creation/removal) are enabled."""
+    return _env_bool("ENABLE_DANGEROUS_TOOLS", default=False)
+
+
+def extension_execution_enabled() -> bool:
+    """Whether runtime execution of user-generated extension tools is enabled."""
+    return _env_bool("ENABLE_EXTENSION_EXECUTION", default=False)

@@ -7,8 +7,9 @@ GCPClaw combines ADK's agent runtime with multi-model support and Pi-style self-
 ## Features
 
 - **Multi-model** — Gemini (native), Claude, GPT-4o, or any LiteLLM-compatible model
-- **Self-extending** — Agent creates new tools at runtime via `create_extension`, persisted to disk
-- **Sandboxed extensions** — AST-validated code, blocked dangerous imports/builtins
+- **Self-extending** — Agent can generate extension tool code via `create_extension`, persisted to disk
+- **Policy-gated runtime** — Dangerous tools and extension execution are disabled by default
+- **Isolated extension execution** — Extension calls run out-of-process (no in-process dynamic imports)
 - **SKILL.md discovery** — Portable skill format compatible with the open Agent Skills spec
 - **Built-in tools** — Web search, URL fetch, file ops (sandboxed), shell commands
 - **CLI + Web UI** — Powered by ADK's built-in `adk run` and `adk web`
@@ -28,6 +29,9 @@ pip install -r requirements.txt
 # Configure
 cp .env.example .env
 # Edit .env — add at least one API key (Google, Anthropic, or OpenAI)
+# Keep security flags at defaults unless you explicitly want risky tools:
+# ENABLE_DANGEROUS_TOOLS=false
+# ENABLE_EXTENSION_EXECUTION=false
 
 # Run
 adk web gcpclaw    # Web UI at http://localhost:8000
@@ -75,10 +79,10 @@ Ask the agent to create a tool it doesn't have:
 
 The agent will:
 1. Write Python code defining the tool function
-2. Validate it against sandbox rules (no network, no subprocess, no dangerous ops)
+2. Validate it against strict static rules (allowlisted imports, blocked dangerous patterns)
 3. Save it to `extensions/` with a `SKILL.md` for discoverability
-4. Load it immediately — the new tool is available in the same session
-5. Auto-load it on future startups
+4. Keep execution disabled unless you set `ENABLE_EXTENSION_EXECUTION=true`
+5. Auto-discover it on future startups
 
 ## Tools
 
@@ -89,10 +93,28 @@ The agent will:
 | `read_file` | Read files from sandboxed workspace |
 | `write_file` | Write files to sandboxed workspace |
 | `list_files` | List workspace directory contents |
-| `run_command` | Execute shell commands (dangerous commands blocked) |
+| `run_command` | Execute allowlisted shell commands (disabled unless ENABLE_DANGEROUS_TOOLS=true) |
 | `create_extension` | Create new tool extensions at runtime |
 | `list_extensions` | List installed extensions |
 | `remove_extension` | Remove an extension |
+
+## Security Notes
+
+- `run_command`, `create_extension`, and `remove_extension` are disabled unless `ENABLE_DANGEROUS_TOOLS=true`
+- `fetch_url` includes SSRF guardrails: only `http/https`, no localhost/private/link-local targets, no redirects
+- File tools use strict path ancestry checks to block traversal
+- Extension code is never imported into the main process
+
+## Development
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+ruff check gcpclaw tests
+mypy gcpclaw
+pytest
+bandit -q -r gcpclaw
+pip-audit -r requirements.txt
+```
 
 ## License
 
